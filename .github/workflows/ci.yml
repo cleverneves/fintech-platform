@@ -1,0 +1,59 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service:
+          [auth-service, account-service, wallet-service, exchange-service]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v3
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "pnpm"
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Type Check
+        run: pnpm --filter @fintech/${{ matrix.service }} exec tsc --noEmit
+
+      - name: Build
+        run: pnpm --filter @fintech/${{ matrix.service }} build
+
+      - name: Docker Build
+        run: |
+          docker build -t ${{ matrix.service }}:${{ github.sha }} \
+            -f apps/${{ matrix.service }}/Dockerfile .
+
+      - name: Push to Registry
+        if: github.ref == 'refs/heads/main'
+        run: |
+          echo ${{ secrets.REGISTRY_PASSWORD }} | docker login -u ${{ secrets.REGISTRY_USER }} --password-stdin
+          docker tag ${{ matrix.service }}:${{ github.sha }} \
+            ${{ secrets.REGISTRY }}/${{ matrix.service }}:${{ github.sha }}
+          docker push ${{ secrets.REGISTRY }}/${{ matrix.service }}:${{ github.sha }}
+
+      - name: Update GitOps Manifests
+        if: github.ref == 'refs/heads/main'
+        run: |
+          sed -i "s|tag:.*|tag: ${{ github.sha }}|" \
+            infra/helm/${{ matrix.service }}/values.yaml
+          git config user.email "ci@fintech.com"
+          git config user.name "CI Bot"
+          git add infra/helm/${{ matrix.service }}/values.yaml
+          git commit -m "ci: update ${{ matrix.service }} to ${{ github.sha }}" || true
+          git push
