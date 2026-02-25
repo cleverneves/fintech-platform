@@ -1,0 +1,21 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: auth-service
+  namespace: argocd
+spec:
+  project: fintech
+  source:
+    repoURL: https://github.com/your-org/fintech-platform
+    targetRevision: main
+    path: infra/helm/auth-service
+    helm:
+      valueFiles:
+        - values.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: fintech-prod
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
