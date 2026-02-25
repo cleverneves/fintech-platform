@@ -1,0 +1,389 @@
+version: "3.9"
+
+# =============================================================================
+# FINTECH PLATFORM — Docker Compose (Full Stack)
+# Uso: docker-compose up -d
+# =============================================================================
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  networks:
+    - fintech-net
+
+x-healthcheck-defaults: &healthcheck-defaults
+  interval: 10s
+  timeout: 5s
+  retries: 5
+  start_period: 20s
+
+# =============================================================================
+# INFRA — Mensageria
+# =============================================================================
+services:
+  zookeeper:
+    <<: *service-defaults
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: fintech-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181 | grep imok"]
+
+  kafka:
+    <<: *service-defaults
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: fintech-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 48
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      <<: *healthcheck-defaults
+      test:
+        [
+          "CMD",
+          "kafka-broker-api-versions",
+          "--bootstrap-server",
+          "localhost:29092",
+        ]
+
+  kafka-ui:
+    <<: *service-defaults
+    image: provectuslabs/kafka-ui:latest
+    container_name: fintech-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8085:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: fintech-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: fintech-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - fintech-net
+    entrypoint: ["/bin/bash", "-c"]
+    command: |
+      "
+      echo 'Creating Kafka topics...'
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic user.events        --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic transaction.events --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic wallet.events      --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic exchange.events    --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic audit.events       --partitions 3 --replication-factor 1
+      echo 'Topics created.'
+      "
+    restart: "no"
+
+  # =============================================================================
+  # INFRA — Banco de Dados
+  # =============================================================================
+
+  postgres:
+    <<: *service-defaults
+    image: postgres:16-alpine
+    container_name: fintech-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: fintech
+      POSTGRES_PASSWORD: fintech123
+      POSTGRES_DB: fintech
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "pg_isready -U fintech"]
+
+  # =============================================================================
+  # INFRA — Cache
+  # =============================================================================
+
+  redis:
+    <<: *service-defaults
+    image: redis:7-alpine
+    container_name: fintech-redis
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD", "redis-cli", "ping"]
+
+  redis-commander:
+    <<: *service-defaults
+    image: rediscommander/redis-commander:latest
+    container_name: fintech-redis-ui
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8086:8081"
+    environment:
+      REDIS_HOSTS: local:redis:6379
+
+  # =============================================================================
+  # INFRA — Observabilidade
+  # =============================================================================
+
+  otel-collector:
+    <<: *service-defaults
+    image: otel/opentelemetry-collector-contrib:0.99.0
+    container_name: fintech-otel-collector
+    volumes:
+      - ./infra/otel/otel-config.yml:/etc/otel-collector-config.yml
+    command: ["--config=/etc/otel-collector-config.yml"]
+    ports:
+      - "4317:4317" # gRPC
+      - "4318:4318" # HTTP
+    depends_on:
+      - jaeger
+
+  jaeger:
+    <<: *service-defaults
+    image: jaegertracing/all-in-one:1.57
+    container_name: fintech-jaeger
+    ports:
+      - "16686:16686" # UI
+      - "14268:14268" # HTTP collector
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+
+  prometheus:
+    <<: *service-defaults
+    image: prom/prometheus:v2.51.0
+    container_name: fintech-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+
+  grafana:
+    <<: *service-defaults
+    image: grafana/grafana:10.4.0
+    container_name: fintech-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+
+  # =============================================================================
+  # MICROSERVICES
+  # =============================================================================
+
+  auth-service:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: apps/auth-service/Dockerfile
+    container_name: fintech-auth-service
+    ports:
+      - "3001:3001"
+      - "9464:9464" # métricas Prometheus
+    environment:
+      NODE_ENV: development
+      PORT: 3001
+      DATABASE_URL: postgresql://fintech:fintech123@postgres:5432/fintech_auth
+      KAFKA_BROKERS: kafka:29092
+      JWT_SECRET: super-secret-jwt-key-change-in-prod
+      LOG_LEVEL: info
+      OTLP_ENDPOINT: http://otel-collector:4318/v1/traces
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3001/health || exit 1"]
+
+  account-service:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: apps/account-service/Dockerfile
+    container_name: fintech-account-service
+    ports:
+      - "3002:3002"
+      - "9465:9464"
+    environment:
+      NODE_ENV: development
+      PORT: 3002
+      DATABASE_URL: postgresql://fintech:fintech123@postgres:5432/fintech_accounts
+      KAFKA_BROKERS: kafka:29092
+      JWT_SECRET: super-secret-jwt-key-change-in-prod
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: info
+      OTLP_ENDPOINT: http://otel-collector:4318/v1/traces
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3002/health || exit 1"]
+
+  wallet-service:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: apps/wallet-service/Dockerfile
+    container_name: fintech-wallet-service
+    ports:
+      - "3003:3003"
+      - "9466:9464"
+    environment:
+      NODE_ENV: development
+      PORT: 3003
+      DATABASE_URL: postgresql://fintech:fintech123@postgres:5432/fintech_wallets
+      KAFKA_BROKERS: kafka:29092
+      JWT_SECRET: super-secret-jwt-key-change-in-prod
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: info
+      OTLP_ENDPOINT: http://otel-collector:4318/v1/traces
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3003/health || exit 1"]
+
+  exchange-service:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: apps/exchange-service/Dockerfile
+    container_name: fintech-exchange-service
+    ports:
+      - "3004:3004"
+      - "9467:9464"
+    environment:
+      NODE_ENV: development
+      PORT: 3004
+      DATABASE_URL: postgresql://fintech:fintech123@postgres:5432/fintech_exchange
+      KAFKA_BROKERS: kafka:29092
+      JWT_SECRET: super-secret-jwt-key-change-in-prod
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: info
+      OTLP_ENDPOINT: http://otel-collector:4318/v1/traces
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3004/health || exit 1"]
+
+  api-gateway:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: apps/api-gateway/Dockerfile
+    container_name: fintech-api-gateway
+    ports:
+      - "3000:3000"
+      - "9463:9464"
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      AUTH_SERVICE_URL: http://auth-service:3001
+      ACCOUNT_SERVICE_URL: http://account-service:3002
+      WALLET_SERVICE_URL: http://wallet-service:3003
+      EXCHANGE_SERVICE_URL: http://exchange-service:3004
+      JWT_SECRET: super-secret-jwt-key-change-in-prod
+      LOG_LEVEL: info
+      OTLP_ENDPOINT: http://otel-collector:4318/v1/traces
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      account-service:
+        condition: service_healthy
+      wallet-service:
+        condition: service_healthy
+      exchange-service:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"]
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+
+volumes:
+  postgres_data:
+  redis_data:
+  kafka_data:
+  zookeeper_data:
+  zookeeper_log:
+  prometheus_data:
+  grafana_data:
+
+# =============================================================================
+# NETWORK
+# =============================================================================
+
+networks:
+  fintech-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

@@ -1,16 +1,48 @@
 global:
   scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    environment: local
+    project: fintech-platform
 
 scrape_configs:
+  # API Gateway
+  - job_name: "api-gateway"
+    static_configs:
+      - targets: ["api-gateway:9464"]
+    metrics_path: /metrics
+
+  # Auth Service
   - job_name: "auth-service"
     static_configs:
-      - targets: ["host.docker.internal:9464"]
+      - targets: ["auth-service:9464"]
+    metrics_path: /metrics
+
+  # Account Service
   - job_name: "account-service"
     static_configs:
-      - targets: ["host.docker.internal:9465"]
+      - targets: ["account-service:9464"]
+    metrics_path: /metrics
+
+  # Wallet Service
   - job_name: "wallet-service"
     static_configs:
-      - targets: ["host.docker.internal:9466"]
+      - targets: ["wallet-service:9464"]
+    metrics_path: /metrics
+
+  # Exchange Service
   - job_name: "exchange-service"
     static_configs:
-      - targets: ["host.docker.internal:9467"]
+      - targets: ["exchange-service:9464"]
+    metrics_path: /metrics
+
+  # OTel Collector (self-metrics)
+  - job_name: "otel-collector"
+    static_configs:
+      - targets: ["otel-collector:8889"]
+    metrics_path: /metrics
+
+  # Kafka (via JMX exporter — opcional, adicionar depois)
+  # - job_name: 'kafka'
+  #   static_configs:
+  #     - targets: ['kafka:9101']
